@@ -1,168 +1,28 @@
 import { Bot } from 'mineflayer'
 import { Block } from 'prismarine-block'
-import { Movements, goals, ComputedPath } from 'mineflayer-pathfinder'
-import { TemporarySubscriber } from './TemporarySubscriber'
+import { Movements } from 'mineflayer-pathfinder'
 import { Entity } from 'prismarine-entity'
-import { error } from './Util'
 import { Vec3 } from 'vec3'
 import { emptyInventoryIfFull, ItemFilter } from './Inventory'
 import { findFromVein } from './BlockVeins'
-import { Collectable, Targets } from './Targets'
+import { Collectable, CollectTarget, Targets } from './targets/Targets'
 import { Item } from 'prismarine-item'
-import mcDataLoader from 'minecraft-data'
+import { BlockTarget } from './targets/BlockTarget'
+import { ItemDropTarget } from './targets/ItemDropTarget'
+import { UnknownCollectableError } from './errors/UnknownCollectableError'
+import events from 'events'
 
 export type Callback = (err?: Error) => void
 
-function collectAll (bot: Bot, options: CollectOptionsFull, cb: Callback): void {
-  const tempEvents = new TemporarySubscriber(bot)
+async function collectAll (bot: Bot, options: CollectOptionsFull): Promise<void> {
+  const chestLocations = options.chestLocations
+  const itemFilter = options.itemFilter
 
-  tempEvents.subscribeTo('entityGone', (entity: Entity) => {
-    options.targets.removeTarget(entity)
-  })
-
-  const collectNext = (err?: Error): void => {
-    if (err != null) {
-      tempEvents.cleanup()
-      cb(err)
-      return
-    }
-
-    if (!options.targets.empty) {
-      emptyInventoryIfFull(bot, options.chestLocations, options.itemFilter, (err?: Error) => {
-        if (err != null) {
-          tempEvents.cleanup()
-          cb(err)
-          return
-        }
-
-        const closest = options.targets.getClosest()
-
-        if (closest == null) {
-          tempEvents.cleanup()
-          cb()
-          return
-        }
-
-        if (closest.constructor.name === 'Block') {
-          collectBlock(bot, closest as Block, options, () => setTimeout(collectNext, 0))
-        } else if (closest.constructor.name === 'Entity') {
-          collectItem(bot, closest as Entity, options, () => setTimeout(collectNext, 0))
-        } else {
-          cb(error('UnknownType', `Target ${closest.constructor.name} is not a Block or Entity!`))
-        }
-      })
-    } else {
-      tempEvents.cleanup()
-      cb()
-    }
+  let target: CollectTarget | null
+  while ((target = options.targets.getClosest()) != null) {
+    await emptyInventoryIfFull({ bot, chestLocations, itemFilter })
+    await target.collect()
   }
-
-  collectNext()
-}
-
-function collectBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: Callback): void {
-  // @ts-expect-error
-  const pathfinder = bot.pathfinder
-
-  const goal = new goals.GoalGetToBlock(block.position.x, block.position.y, block.position.z)
-  pathfinder.setGoal(goal)
-
-  const tempEvents = new TemporarySubscriber(bot)
-
-  tempEvents.subscribeTo('goal_reached', () => {
-    tempEvents.cleanup()
-    mineBlock(bot, block, options, cb)
-  })
-
-  tempEvents.subscribeTo('goal_updated', () => {
-    tempEvents.cleanup()
-    cb(error('PathfindingInterrupted', 'Pathfinding interrupted before block reached.'))
-  })
-
-  if (!options.ignoreNoPath) {
-    tempEvents.subscribeTo('path_update', (results: ComputedPath) => {
-      if (results.status === 'noPath') {
-        tempEvents.cleanup()
-        cb(error('NoPath', 'No path to target block!'))
-      }
-    })
-  }
-}
-
-function mineBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: Callback): void {
-  selectBestTool(bot, block, () => {
-    // Do nothing if the block is already air
-    // Sometimes happens if the block is broken before the bot reaches it
-    if (block.type === 0) {
-      cb()
-      return
-    }
-
-    const tempEvents = new TemporarySubscriber(bot)
-
-    tempEvents.subscribeTo('itemDrop', (entity: Entity) => {
-      if (entity.position.distanceTo(block.position.offset(0.5, 0.5, 0.5)) <= 0.5) {
-        options.targets.appendTarget(entity)
-      }
-    })
-
-    bot.dig(block).then(() => {
-      let remainingTicks = 10
-      tempEvents.subscribeTo('physicTick', () => {
-        remainingTicks--
-
-        if (remainingTicks <= 0) {
-          options.targets.removeTarget(block)
-          tempEvents.cleanup()
-          cb()
-        }
-      })
-    }).catch(err => {
-      tempEvents.cleanup()
-      cb(err)
-    })
-  })
-}
-
-function selectBestTool (bot: Bot, block: Block, cb: () => void): void {
-  const options = {
-    requireHarvest: true,
-    getFromChest: true,
-    maxTools: 2
-  }
-
-  // @ts-expect-error
-  const toolPlugin: Tool = bot.tool
-  toolPlugin.equipForBlock(block, options, cb)
-}
-
-function collectItem (bot: Bot, targetEntity: Entity, options: CollectOptionsFull, cb: Callback): void {
-  // Don't collect any entities that are marked as 'invalid'
-  if (!targetEntity.isValid) {
-    cb()
-    return
-  }
-
-  const goal = new goals.GoalFollow(targetEntity, 0)
-
-  // @ts-expect-error
-  const pathfinder = bot.pathfinder
-  pathfinder.setGoal(goal, true)
-
-  const tempEvents = new TemporarySubscriber(bot)
-
-  tempEvents.subscribeTo('entityGone', (entity: Entity) => {
-    if (entity === targetEntity) {
-      tempEvents.cleanup()
-      cb()
-    }
-  })
-
-  tempEvents.subscribeTo('goal_updated', (newGoal: goals.Goal | null) => {
-    if (newGoal === goal) return
-    tempEvents.cleanup()
-    cb(error('PathfindingInterrupted', 'Pathfinding interrupted before item could be reached.'))
-  })
 }
 
 /**
@@ -201,12 +61,13 @@ export interface CollectOptions {
 /**
  * A version of collect options where all values are assigned.
  */
-interface CollectOptionsFull {
+export interface CollectOptionsFull {
   append: boolean
   ignoreNoPath: boolean
   chestLocations: Vec3[]
   itemFilter: ItemFilter
   targets: Targets
+  movements?: Movements
 }
 
 /**
@@ -225,6 +86,8 @@ export class CollectBlock {
 
   /**
      * The movements configuration to be sent to the pathfinder plugin.
+     *
+     * @deprecated
      */
   movements?: Movements
 
@@ -244,17 +107,8 @@ export class CollectBlock {
      * @returns True if the item should be moved into the chest. False otherwise.
      */
   itemFilter: ItemFilter = (item: Item) => {
-    if (item.name.includes('helmet')) return false
-    if (item.name.includes('chestplate')) return false
-    if (item.name.includes('leggings')) return false
-    if (item.name.includes('boots')) return false
-    if (item.name.includes('shield')) return false
-    if (item.name.includes('sword')) return false
-    if (item.name.includes('pickaxe')) return false
-    if (item.name.includes('axe')) return false
-    if (item.name.includes('shovel')) return false
-    if (item.name.includes('hoe')) return false
-    return true
+    const itemNames = ['helmet', 'chestplate', 'leggings', 'boots', 'shield', 'sword', 'pickaxe', 'axe', 'shovel', 'hoe']
+    return itemNames.some(o => item.name.includes(o))
   }
 
   /**
@@ -264,8 +118,7 @@ export class CollectBlock {
      */
   constructor (bot: Bot) {
     this.bot = bot
-    this.targets = new Targets(bot)
-    this.movements = new Movements(bot, mcDataLoader(bot.version))
+    this.targets = new Targets()
   }
 
   /**
@@ -280,7 +133,7 @@ export class CollectBlock {
      *
      * @param target - The block(s) or item(s) to collect.
      * @param options - The set of options to use when handling these targets
-     * @param cb - The callback that is called finished.
+     * @param cb - The callback.
      */
   collect (target: Collectable | Collectable[], options: CollectOptions | Callback = {}, cb: Callback = () => {}): void {
     if (typeof options === 'function') {
@@ -288,6 +141,25 @@ export class CollectBlock {
       options = {}
     }
 
+    this.collectAsync(target, options)
+      .then(() => cb())
+      .catch(err => cb(err))
+  }
+
+  /**
+     * If target is a block:
+     * Causes the bot to break and collect the target block.
+     *
+     * If target is an item drop:
+     * Causes the bot to collect the item drop.
+     *
+     * If target is an array containing items or blocks, preforms the correct action for
+     * all targets in that array sorting dynamically by distance.
+     *
+     * @param target - The block(s) or item(s) to collect.
+     * @param options - The set of options to use when handling these targets
+     */
+  async collectAsync (target: Collectable | Collectable[], options: CollectOptions): Promise<void> {
     const optionsFull: CollectOptionsFull = {
       append: options.append ?? false,
       ignoreNoPath: options.ignoreNoPath ?? false,
@@ -296,50 +168,28 @@ export class CollectBlock {
       targets: this.targets
     }
 
-    // @ts-expect-error
-    const pathfinder = this.bot.pathfinder
-    if (pathfinder == null) {
-      cb(error('UnresolvedDependency', 'The mineflayer-collectblock plugin relies on the mineflayer-pathfinder plugin to run!'))
-      return
-    }
+    if (!Array.isArray(target)) target = [target]
 
-    // @ts-expect-error
-    const tool = this.bot.tool
-    if (tool == null) {
-      cb(error('UnresolvedDependency', 'The mineflayer-collectblock plugin relies on the mineflayer-tool plugin to run!'))
-      return
+    if (!optionsFull.append) {
+      await this.cancelTaskAsync()
     }
 
     if (this.movements != null) {
+    // @ts-expect-error
+      const pathfinder: Pathfinder = this.bot.pathfinder
       pathfinder.setMovements(this.movements)
     }
 
-    const beginCollect = (startNew: boolean): void => {
-      if (Array.isArray(target)) this.targets.appendTargets(target)
-      else this.targets.appendTarget(target)
-
-      if (startNew) {
-        collectAll(this.bot, optionsFull, (err) => {
-          if (err != null) {
-            // Clear the current task on error, since we can't be sure we cleaned up properly
-            this.targets.clear()
-          }
-
-          // @ts-expect-error
-          this.bot.emit('collectBlock_finished')
-
-          cb(err)
-        })
-      }
+    for (const t of target) {
+      if (t instanceof Block) this.targets.appendTarget(new BlockTarget(this.bot, t, optionsFull))
+      else if (t instanceof Entity) this.targets.appendTarget(new ItemDropTarget(this.bot, t))
+      else throw new UnknownCollectableError('Unknown collectable type!')
     }
 
-    if (!optionsFull.append) {
-      this.cancelTask(() => {
-        beginCollect(true)
-      })
-    } else {
-      beginCollect(this.targets.empty)
-    }
+    await collectAll(this.bot, optionsFull)
+
+    // @ts-expect-error ; custom error
+    this.bot.emit('collectBlock_finished')
   }
 
   /**
@@ -357,15 +207,21 @@ export class CollectBlock {
 
   /**
    * Cancels the current collection task, if still active.
-   *
-   * @param cb - The callback to use when the task is stopped.
+     * @param cb - The callback.
    */
-  cancelTask (cb: Callback = () => {}): void {
-    if (this.targets.empty) {
-      cb()
-    } else {
-      // @ts-expect-error
-      this.bot.once('collectBlock_finished', cb)
-    }
+  cancelTask (cb: Callback): void {
+    this.cancelTaskAsync()
+      .then(() => cb())
+      .catch(err => cb(err))
+  }
+
+  /**
+   * Cancels the current collection task, if still active.
+   */
+  async cancelTaskAsync (): Promise<void> {
+    if (this.targets.empty) return
+
+    this.targets.clear()
+    await events.once(this.bot, 'collectBlock_finished')
   }
 }
