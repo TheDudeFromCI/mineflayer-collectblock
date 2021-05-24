@@ -44,9 +44,9 @@ function collectAll (bot: Bot, options: CollectOptionsFull, cb: Callback): void 
         }
 
         if (closest.constructor.name === 'Block') {
-          collectBlock(bot, closest as Block, options, () => setTimeout(collectNext, 0))
+          collectBlock(bot, closest as Block, options, (err) => setTimeout(() => collectNext(err), 0))
         } else if (closest.constructor.name === 'Entity') {
-          collectItem(bot, closest as Entity, options, () => setTimeout(collectNext, 0))
+          collectItem(bot, closest as Entity, options, (err) => setTimeout(() => collectNext(err), 0))
         } else {
           cb(error('UnknownType', `Target ${closest.constructor.name} is not a Block or Entity!`))
         }
@@ -84,13 +84,22 @@ function collectBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: 
       if (results.status === 'noPath') {
         tempEvents.cleanup()
         cb(error('NoPath', 'No path to target block!'))
+      } else if (results.status === 'timeout') {
+        console.log('timeout')
+        tempEvents.cleanup()
+        cb(error('Timeout', 'Took to long to decide path to goal!'))
       }
     })
   }
 }
 
 function mineBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: Callback): void {
-  selectBestTool(bot, block, () => {
+  selectBestTool(bot, block, (err) => {
+    // NOTE: note sure if this error check should come first.
+    if (err != null) {
+      cb(err)
+      return
+    }
     // Do nothing if the block is already air
     // Sometimes happens if the block is broken before the bot reaches it
     if (block.type === 0) {
@@ -108,7 +117,7 @@ function mineBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: Cal
 
     bot.dig(block).then(() => {
       let remainingTicks = 10
-      tempEvents.subscribeTo('physicTick', () => {
+      tempEvents.subscribeTo('physicsTick', () => {
         remainingTicks--
 
         if (remainingTicks <= 0) {
@@ -124,7 +133,7 @@ function mineBlock (bot: Bot, block: Block, options: CollectOptionsFull, cb: Cal
   })
 }
 
-function selectBestTool (bot: Bot, block: Block, cb: () => void): void {
+function selectBestTool (bot: Bot, block: Block, cb: (err?: Error) => void): void {
   const options = {
     requireHarvest: true,
     getFromChest: true,
